@@ -1,0 +1,7 @@
+OK wallet 1 created for Alice
+OK wallet 2 created for Bob
+OK deposited 200 into wallet 1
+ERROR insufficient funds
+OK transferred 50 from wallet 1 to wallet 2
+OK gift card 2 created with balance 100
+OK gift card 2 expired with breakage 100.0
