@@ -4,7 +4,7 @@ A deterministic, command-file-driven stored-value ledger engine built in **Pytho
 
 ## Demo Video
 
-- **5-Minute Capstone Walkthrough:** [Watch the T037-PS-054 Demo Video](<your-demo-video-link>)
+- **5-Minute Capstone Walkthrough:** [Watch the T037-PS-054 Demo Video](https://drive.google.com/file/d/1hZmWBMcATdVORGtofV-kGAvjyrqbbV9y/view?usp=sharing)
 
 ## Architecture & Data Model
 
