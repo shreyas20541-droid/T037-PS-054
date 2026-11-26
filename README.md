@@ -78,3 +78,7 @@ The reports are written to the output directory. Money columns are formatted wit
 Unactivated cards are automatically voided once day 180 has passed (activation on day 180 remains valid). The original tender and amount of each refund are persisted in the `card_refunds` table in `ledger.db`.
 
 The schema and rule register are described in [the design document](docs/DESIGN_DOCUMENT.md); implementation tradeoffs are listed in [the decision log](docs/DECISION_LOG.md).
+
+## Demo Video
+
+* **5-Minute Walkthrough:** https://drive.google.com/file/d/1hZmWBMcATdVORGtofV-kGAvjyrqbbV9y/view?usp=sharing
