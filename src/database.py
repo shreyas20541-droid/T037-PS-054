@@ -21,6 +21,7 @@ def create_database(db_path: str) -> None:
             DROP TABLE IF EXISTS ledger_entries;
             DROP TABLE IF EXISTS monthly_reports;
             DROP TABLE IF EXISTS breakage_records;
+            DROP TABLE IF EXISTS card_refunds;
             DROP TABLE IF EXISTS lots;
             DROP TABLE IF EXISTS gift_cards;
             DROP TABLE IF EXISTS wallets;
@@ -54,6 +55,14 @@ def create_database(db_path: str) -> None:
                 expiry_date TEXT,
                 frozen_ts TEXT,
                 waiver_used INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE card_refunds (
+                card_id TEXT PRIMARY KEY,
+                refund_date TEXT NOT NULL,
+                original_tender TEXT NOT NULL,
+                amount REAL NOT NULL,
+                FOREIGN KEY (card_id) REFERENCES gift_cards(card_id)
             );
 
             CREATE TABLE lots (

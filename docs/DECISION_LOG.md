@@ -17,3 +17,8 @@
 | 13 | Permit one post-expiry reactivation with a 10% fee and a six-month new expiry. | Restore most value during the defined grace period without indefinite repeated extensions. |
 | 14 | Freeze lost cards immediately; after seven calendar days transfer remaining value less a fee capped at Rs 50. | Add a quiet period for loss claims and preserve the original expiry on replacement value. |
 | 15 | Calculate month-end liability from active lots and publish reconciliation and breakage rows from ledger state. | Give finance an auditable close while recognizing only positive value that has passed the expiry grace period. |
+| 16 | Use calendar anniversaries for gift-card three-year validity and paid-load one-year expiry. | Match the stated business durations across leap years rather than approximating them as 365 days. |
+| 17 | Treat day 180 as the last valid activation day; auto-void and record an original-tender refund from day 181. | Preserve the stated activation boundary and make the unactivated-card refund auditable. |
+| 18 | Write a month-end reminder snapshot for active lots expiring in the following 30 days, and exclude negative wallet balances from liability. | Make expiry follow-up reproducible and keep the month-end liability consistent with the brief's negative-wallet exclusion. |
+| 19 | Apply daily wallet velocity limits to the stored-value amount after any bill restriction cap. | Enforce each KYC tier's spend ceiling against actual wallet spend rather than the unapproved request amount. |
+| 20 | Require exact month-end liability equality after rounding ledger amounts to paisa. | A one-paisa difference is a reconciliation failure, not a tolerance-sized success. |

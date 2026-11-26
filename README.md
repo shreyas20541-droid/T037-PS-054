@@ -6,7 +6,7 @@ A command-file-driven stored-value ledger for issuing and redeeming gift cards, 
 
 `src/main.py` parses the input and output directory options and invokes the pipeline. `src/processor.py` ingests the master CSVs, processes each nonblank, noncomment command in physical file order, applies the business rules, writes ledger entries and decisions, and generates the CSV reports. `src/database.py` creates the SQLite schema and connections. `tests/test_ledger.py` exercises the major business rules using temporary databases and input files.
 
-Each monetary balance is tracked by lot so expiry and redemption allocation remain auditable. SQLite stores the wallet and card entities, lots, redemptions and their allocations, ledger entries, monthly reports, and breakage records. Runtime state and output files are written under `data/output/` by default.
+Each monetary balance is tracked by lot so expiry and redemption allocation remain auditable. SQLite stores the wallet and card entities, lots, redemptions and their allocations, ledger entries, monthly reports, breakage records, and original-tender refunds for auto-voided cards. Runtime state and output files are written under `data/output/` by default.
 
 ## Directory Structure
 
@@ -65,7 +65,7 @@ The command argument order and the full source data notes are in [the sample-dat
 
 ## Generated CSVs
 
-The four reports are written to the output directory. Money columns are formatted with exactly two decimal places. Decision rows are emitted for `LOAD_WALLET`, `REDEEM`, `REVERSE`, `CHARGEBACK`, `REACTIVATE`, and `TRANSFER_LOST`; issuance and activation outcomes are reflected in database/card state rather than `decisions.csv`.
+The reports are written to the output directory. Money columns are formatted with exactly two decimal places. Decision rows are emitted for `LOAD_WALLET`, `REDEEM`, `REVERSE`, `CHARGEBACK`, `REACTIVATE`, and `TRANSFER_LOST`; issuance and activation outcomes are reflected in database/card state rather than `decisions.csv`.
 
 | File | Columns, in order | Contents |
 |---|---|---|
@@ -73,5 +73,8 @@ The four reports are written to the output directory. Money columns are formatte
 | `statements.csv` | `id, entry_ts, entry_type, lot_ref, lot_expiry, debit, credit, lot_balance_after, total_balance_after` | Lot-level ledger entries for each `PRINT_STATEMENT` command. |
 | `liability_report.csv` | `month, opening_liability, loads, redemptions, reversals, expiries, chargebacks, closing_liability, reconciles` | One row for each processed month end, including the reconciliation flag. |
 | `breakage_report.csv` | `recognition_date, id, lot_ref, expiry_date, amount` | Positive expired lot balances recognized as breakage. |
+| `reminders.csv` | `as_of_date, id, lot_ref, expiry_date, remaining_balance` | Lots expiring in the 30 days after each processed month end. |
+
+Unactivated cards are automatically voided once day 180 has passed (activation on day 180 remains valid). The original tender and amount of each refund are persisted in the `card_refunds` table in `ledger.db`.
 
 The schema and rule register are described in [the design document](docs/DESIGN_DOCUMENT.md); implementation tradeoffs are listed in [the decision log](docs/DECISION_LOG.md).

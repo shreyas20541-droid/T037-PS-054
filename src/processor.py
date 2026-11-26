@@ -40,6 +40,7 @@ class LedgerEngine:
 
         self.decisions: List[Dict[str, str]] = []
         self.statements: List[Dict[str, str]] = []
+        self.reminders: List[Dict[str, str]] = []
 
         self.month_flows: Dict[str, Dict[str, float]] = {}
         self.last_closing_liability: float = 0.0
@@ -122,9 +123,51 @@ class LedgerEngine:
 
     def _all_active_liability(self) -> float:
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(remaining_amount), 0.0) AS bal FROM lots WHERE status = 'ACTIVE'"
+            """SELECT COALESCE(SUM(balance), 0.0) AS bal
+               FROM (
+                   SELECT owner_type, owner_id, SUM(remaining_amount) AS balance
+                   FROM lots
+                   WHERE status = 'ACTIVE'
+                   GROUP BY owner_type, owner_id
+                   HAVING owner_type != 'WALLET' OR SUM(remaining_amount) >= 0
+               )"""
         ).fetchone()
         return round(float(row["bal"]), 2)
+
+    def _wallet_liability(self, wallet_id: str) -> float:
+        return max(0.0, self._active_balance(wallet_id))
+
+    def _void_due_cards(self, cutoff_ts: str) -> None:
+        cutoff_date = parse_ts(cutoff_ts).date()
+        rows = self.conn.execute(
+            "SELECT card_id, issue_ts, initial_value, buyer_tender FROM gift_cards WHERE status = 'INACTIVE'"
+        ).fetchall()
+        for card in rows:
+            issue_date = parse_ts(card["issue_ts"]).date()
+            void_date = issue_date + timedelta(days=181)
+            if void_date > cutoff_date:
+                continue
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE gift_cards SET status = 'VOIDED' WHERE card_id = ? AND status = 'INACTIVE'",
+                    (card["card_id"],),
+                )
+                if self.conn.execute("SELECT changes()").fetchone()[0] == 0:
+                    continue
+                self.conn.execute(
+                    "UPDATE lots SET status = 'CLOSED', remaining_amount = 0.0 WHERE lot_ref = ?",
+                    (card["card_id"],),
+                )
+                self.conn.execute(
+                    """INSERT INTO card_refunds (card_id, refund_date, original_tender, amount)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        card["card_id"],
+                        void_date.strftime("%Y-%m-%d"),
+                        card["buyer_tender"],
+                        card["initial_value"],
+                    ),
+                )
 
     def _log_ledger(
         self,
@@ -225,7 +268,7 @@ class LedgerEngine:
                 self.conn.execute("UPDATE lots SET status = 'CLOSED', remaining_amount = 0.0 WHERE lot_ref = ?", (card_id,))
                 return
 
-            expiry_dt = act_dt + timedelta(days=365)
+            expiry_dt = add_months(act_dt, 36)
             expiry_str = expiry_dt.strftime("%Y-%m-%d")
             val = float(card["initial_value"])
 
@@ -264,6 +307,7 @@ class LedgerEngine:
         ).fetchone()
         neg_bal = round(float(neg_row["neg"]), 2)
         net_bal = self._active_balance(wallet_id, date_str)
+        liability_before = max(0.0, net_bal)
 
         if amt_str == "BALANCE_TO_10000":
             amt = max(0.0, round(10000.0 - max(0.0, net_bal), 2))
@@ -296,8 +340,19 @@ class LedgerEngine:
             if round(net_bal + amt, 2) > 200000.0:
                 self._record_decision(line_no, "LOAD_WALLET", ts, wallet_id, load_ref, amt, 0.0, "DECLINED", "HOLDING_LIMIT")
                 return
+            month_loaded_row = self.conn.execute(
+                """SELECT COALESCE(SUM(original_amount), 0.0) AS mload
+                   FROM lots
+                   WHERE owner_id = ? AND substr(created_ts, 1, 7) = ? AND lot_type IN ('PAID', 'PROMO')""",
+                (wallet_id, ym),
+            ).fetchone()
+            if round(float(month_loaded_row["mload"]) + amt, 2) > 100000.0:
+                self._record_decision(
+                    line_no, "LOAD_WALLET", ts, wallet_id, load_ref, amt, 0.0, "DECLINED", "MONTHLY_LOAD_LIMIT"
+                )
+                return
 
-        expiry_dt = dt + timedelta(days=90 if load_type == "PROMO" else 365)
+        expiry_dt = dt + timedelta(days=90) if load_type == "PROMO" else add_months(dt, 12)
         expiry_str = expiry_dt.strftime("%Y-%m-%d")
 
         rem_after_debt = amt
@@ -342,7 +397,9 @@ class LedgerEngine:
             if not still_neg:
                 self.conn.execute("UPDATE wallets SET is_blocked = 0 WHERE wallet_id = ?", (wallet_id,))
 
-            self._flow(ym)["loads"] = round(self._flow(ym)["loads"] + amt, 2)
+            liability_after = self._wallet_liability(wallet_id)
+            liability_increase = round(liability_after - liability_before, 2)
+            self._flow(ym)["loads"] = round(self._flow(ym)["loads"] + liability_increase, 2)
             self._log_ledger(wallet_id, ts, "LOAD", load_ref, expiry_str, 0.0, amt, rem_after_debt)
             self._record_decision(line_no, "LOAD_WALLET", ts, wallet_id, load_ref, amt, amt, "APPROVED", "OK")
 
@@ -358,6 +415,14 @@ class LedgerEngine:
         amt_req = round(float(req_str), 2)
 
         self._expire_due_lots(date_str, ts)
+
+        max_allowed = amt_req
+        partial_reason = "OK"
+        if restricted_amt > 0:
+            cap_70 = round(0.70 * bill_total, 2)
+            if max_allowed > cap_70:
+                max_allowed = cap_70
+                partial_reason = "RESTRICTED_CAP_70"
 
         if self.conn.execute("SELECT 1 FROM redemptions WHERE txn_id = ?", (txn_id,)).fetchone():
             self._record_decision(line_no, "REDEEM", ts, target_id, txn_id, amt_req, 0.0, "DECLINED", "DUPLICATE_TXN")
@@ -409,17 +474,10 @@ class LedgerEngine:
                    WHERE owner_id = ? AND substr(ts, 1, 10) = ? AND reversed = 0""",
                 (target_id, date_str),
             ).fetchone()
-            if wallet["kyc_tier"] == "FULL_KYC" and round(float(spent_row["spent"]) + amt_req, 2) > 50000.0:
+            daily_limit = 50000.0 if wallet["kyc_tier"] == "FULL_KYC" else 10000.0
+            if round(float(spent_row["spent"]) + max_allowed, 2) > daily_limit:
                 self._record_decision(line_no, "REDEEM", ts, target_id, txn_id, amt_req, 0.0, "DECLINED", "VELOCITY")
                 return
-
-        max_allowed = amt_req
-        partial_reason = "OK"
-        if restricted_amt > 0:
-            cap_70 = round(0.70 * bill_total, 2)
-            if max_allowed > cap_70:
-                max_allowed = cap_70
-                partial_reason = "RESTRICTED_CAP_70"
 
         avail = self._active_balance(target_id, date_str)
         if avail <= 0:
@@ -582,7 +640,12 @@ class LedgerEngine:
             "SELECT 1 FROM ledger_entries WHERE entry_type = 'CHARGEBACK' AND lot_ref = ?",
             (load_ref,),
         ).fetchone()
-        if not lot or already_charged_back:
+        if (
+            not lot
+            or lot["owner_type"] != "WALLET"
+            or lot["lot_type"] not in ("PAID", "PROMO")
+            or already_charged_back
+        ):
             self._record_decision(line_no, "CHARGEBACK", ts, wallet_id, load_ref, 0.0, 0.0, "DECLINED", "INVALID_LOT")
             return
 
@@ -597,10 +660,29 @@ class LedgerEngine:
             return
 
         rem = round(float(lot["remaining_amount"]), 2)
+        expired_lot = lot["status"] in ("EXPIRED", "BREAKAGE")
+        liability_before = self._wallet_liability(wallet_id) if not expired_lot else 0.0
         clawback_shortfall = round(orig_amt - rem, 2)
 
         with self.conn:
-            if clawback_shortfall > 0:
+            if expired_lot:
+                breakage_row = self.conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0.0) AS amount FROM breakage_records WHERE lot_ref = ?",
+                    (load_ref,),
+                ).fetchone()
+                recognized_breakage = max(0.0, round(float(breakage_row["amount"]), 2))
+                adjustment = min(recognized_breakage, orig_amt)
+                if adjustment > 0:
+                    self.conn.execute(
+                        """INSERT INTO breakage_records (recognition_date, owner_id, lot_ref, expiry_date, amount)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (dt.strftime("%Y-%m-%d"), wallet_id, load_ref, lot["expiry_date"], -adjustment),
+                    )
+                self.conn.execute(
+                    "UPDATE lots SET remaining_amount = 0.0, status = 'CHARGED_BACK' WHERE lot_ref = ?",
+                    (load_ref,),
+                )
+            elif clawback_shortfall > 0:
                 self.conn.execute(
                     "UPDATE lots SET remaining_amount = ?, status = 'ACTIVE' WHERE lot_ref = ?",
                     (-clawback_shortfall, load_ref),
@@ -612,11 +694,30 @@ class LedgerEngine:
                     (load_ref,),
                 )
 
-            self._flow(ym)["chargebacks"] = round(self._flow(ym)["chargebacks"] + orig_amt, 2)
+            liability_after = self._wallet_liability(wallet_id)
+            liability_removed = round(max(0.0, liability_before - liability_after), 2)
+            self._flow(ym)["chargebacks"] = round(self._flow(ym)["chargebacks"] + liability_removed, 2)
             self._log_ledger(
-                wallet_id, ts, "CHARGEBACK", load_ref, lot["expiry_date"], orig_amt, 0.0, -clawback_shortfall
+                wallet_id,
+                ts,
+                "CHARGEBACK",
+                load_ref,
+                lot["expiry_date"],
+                orig_amt,
+                0.0,
+                0.0 if expired_lot else -clawback_shortfall,
             )
-            self._record_decision(line_no, "CHARGEBACK", ts, wallet_id, load_ref, orig_amt, orig_amt, "APPROVED", "OK")
+            self._record_decision(
+                line_no,
+                "CHARGEBACK",
+                ts,
+                wallet_id,
+                load_ref,
+                orig_amt,
+                orig_amt,
+                "APPROVED",
+                "BREAKAGE_ADJUSTED" if expired_lot else "OK",
+            )
 
     def handle_reactivate(self, line_no: int, parts: List[str]) -> None:
         _, ts, owner_id, load_ref = [p.strip() for p in parts]
@@ -646,6 +747,18 @@ class LedgerEngine:
         fee = round(rem * 0.10, 2)
         new_bal = round(rem - fee, 2)
         new_expiry = add_months(dt, 6).strftime("%Y-%m-%d")
+
+        if lot["owner_type"] == "WALLET":
+            wallet = self.conn.execute(
+                "SELECT kyc_tier FROM wallets WHERE wallet_id = ?", (owner_id,)
+            ).fetchone()
+            if wallet:
+                holding_limit = 10000.0 if wallet["kyc_tier"] == "MIN_KYC" else 200000.0
+                if round(self._active_balance(owner_id, date_str) + new_bal, 2) > holding_limit:
+                    self._record_decision(
+                        line_no, "REACTIVATE", ts, owner_id, load_ref, rem, 0.0, "DECLINED", "HOLDING_LIMIT"
+                    )
+                    return
 
         with self.conn:
             self.conn.execute(
@@ -689,8 +802,15 @@ class LedgerEngine:
             self._record_decision(line_no, "TRANSFER_LOST", ts, old_id, new_id, 0.0, 0.0, "DECLINED", "DUPLICATE_CARD")
             return
 
-        old_lot = self.conn.execute("SELECT * FROM lots WHERE lot_ref = ?", (old_id,)).fetchone()
-        bal = round(float(old_lot["remaining_amount"]), 2)
+        old_lots = self.conn.execute(
+            """SELECT lot_ref, expiry_date, remaining_amount
+               FROM lots
+               WHERE owner_type = 'CARD' AND owner_id = ? AND remaining_amount > 0
+                 AND (status = 'INACTIVE' OR (status = 'ACTIVE' AND expiry_date >= ?))
+               ORDER BY expiry_date, created_ts, lot_ref""",
+            (old_id, dt.strftime("%Y-%m-%d")),
+        ).fetchall()
+        bal = round(sum(float(lot["remaining_amount"]) for lot in old_lots), 2)
 
         frozen_dt = parse_ts(old_card["frozen_ts"])
         if (dt.date() - frozen_dt.date()).days < 7:
@@ -699,28 +819,53 @@ class LedgerEngine:
 
         fee = min(50.0, bal)
         new_bal = round(bal - fee, 2)
-        expiry_str = old_card["expiry_date"] or (dt + timedelta(days=365)).strftime("%Y-%m-%d")
+        expiry_str = old_card["expiry_date"] or add_months(dt, 12).strftime("%Y-%m-%d")
 
         with self.conn:
             self.conn.execute("UPDATE gift_cards SET status = 'TRANSFERRED' WHERE card_id = ?", (old_id,))
-            self.conn.execute(
-                "UPDATE lots SET remaining_amount = 0.0, status = 'TRANSFERRED' WHERE lot_ref = ?",
-                (old_id,),
-            )
+            fee_remaining = fee
+            transfer_lots = []
+            for lot in old_lots:
+                lot_amount = round(float(lot["remaining_amount"]), 2)
+                fee_from_lot = min(fee_remaining, lot_amount)
+                transferred_amount = round(lot_amount - fee_from_lot, 2)
+                fee_remaining = round(fee_remaining - fee_from_lot, 2)
+                self.conn.execute(
+                    "UPDATE lots SET remaining_amount = 0.0, status = 'TRANSFERRED' WHERE lot_ref = ?",
+                    (lot["lot_ref"],),
+                )
+                self._log_ledger(
+                    old_id, ts, "TRANSFER_OUT", lot["lot_ref"], lot["expiry_date"], lot_amount, 0.0, 0.0
+                )
+                if transferred_amount > 0:
+                    transfer_lots.append((lot["expiry_date"], transferred_amount, lot["lot_ref"]))
+
             self.conn.execute(
                 """INSERT INTO gift_cards
                    (card_id, issue_ts, card_type, initial_value, channel, pin, buyer_tender, status, activated_ts, expiry_date)
                    VALUES (?, ?, ?, ?, ?, ?, 'TRANSFER', 'ACTIVE', ?, ?)""",
                 (new_id, ts, old_card["card_type"], new_bal, old_card["channel"], new_pin, ts, expiry_str),
             )
-            self.conn.execute(
-                """INSERT INTO lots
-                   (lot_ref, owner_type, owner_id, lot_type, source, created_ts, expiry_date, original_amount, remaining_amount, status)
-                   VALUES (?, 'CARD', ?, 'CARD', ?, ?, ?, ?, ?, 'ACTIVE')""",
-                (new_id, new_id, old_id, ts, expiry_str, new_bal, new_bal),
-            )
-            self._log_ledger(old_id, ts, "TRANSFER_OUT", old_id, expiry_str, bal, 0.0, 0.0)
-            self._log_ledger(new_id, ts, "TRANSFER_IN", new_id, expiry_str, 0.0, new_bal, new_bal)
+            if not transfer_lots:
+                transfer_lots.append((expiry_str, 0.0, old_id))
+            for index, (lot_expiry, amount, source_lot) in enumerate(transfer_lots, start=1):
+                lot_ref = new_id if index == 1 else f"{new_id}-{index}"
+                self.conn.execute(
+                    """INSERT INTO lots
+                       (lot_ref, owner_type, owner_id, lot_type, source, created_ts, expiry_date, original_amount, remaining_amount, status)
+                       VALUES (?, 'CARD', ?, 'CARD', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        lot_ref,
+                        new_id,
+                        source_lot,
+                        ts,
+                        lot_expiry,
+                        amount,
+                        amount,
+                        "ACTIVE" if amount > 0 else "CLOSED",
+                    ),
+                )
+                self._log_ledger(new_id, ts, "TRANSFER_IN", lot_ref, lot_expiry, 0.0, amount, amount)
             self._flow(ym)["redemptions"] = round(self._flow(ym)["redemptions"] + fee, 2)
             self._record_decision(line_no, "TRANSFER_LOST", ts, old_id, new_id, bal, new_bal, "APPROVED", "OK")
 
@@ -729,6 +874,26 @@ class LedgerEngine:
         last_day = month_last_day(ym)
         end_ts = f"{last_day} 23:59:59"
         end_dt = datetime.strptime(last_day, "%Y-%m-%d")
+
+        reminder_cutoff = (end_dt.date() + timedelta(days=30)).strftime("%Y-%m-%d")
+        reminders = self.conn.execute(
+            """SELECT owner_id, lot_ref, expiry_date, remaining_amount
+               FROM lots
+               WHERE status = 'ACTIVE' AND remaining_amount > 0
+                 AND expiry_date > ? AND expiry_date <= ?
+               ORDER BY expiry_date, created_ts, lot_ref""",
+            (last_day, reminder_cutoff),
+        ).fetchall()
+        for row in reminders:
+            self.reminders.append(
+                {
+                    "as_of_date": last_day,
+                    "id": row["owner_id"],
+                    "lot_ref": row["lot_ref"],
+                    "expiry_date": row["expiry_date"],
+                    "remaining_balance": fmt_money(float(row["remaining_amount"])),
+                }
+            )
 
         rows = self.conn.execute(
             """SELECT lot_ref, owner_id, expiry_date, remaining_amount
@@ -762,14 +927,20 @@ class LedgerEngine:
                         self.conn.execute(
                             """INSERT INTO breakage_records (recognition_date, owner_id, lot_ref, expiry_date, amount)
                                VALUES (?, ?, ?, ?, ?)""",
-                            (last_day, er["owner_id"], er["lot_ref"], er["expiry_date"], amt),
+                            (
+                                (end_dt.date() + timedelta(days=1)).strftime("%Y-%m-%d"),
+                                er["owner_id"],
+                                er["lot_ref"],
+                                er["expiry_date"],
+                                amt,
+                            ),
                         )
 
             opening = round(self.last_closing_liability, 2)
             fl = self._flow(ym)
             closing = self._all_active_liability()
             expected = round(opening + fl["loads"] - fl["redemptions"] + fl["reversals"] - fl["expiries"] - fl["chargebacks"], 2)
-            reconciles = "true" if abs(closing - expected) < 0.02 else "false"
+            reconciles = "true" if closing == expected else "false"
             self.last_closing_liability = closing
 
             self.conn.execute(
@@ -831,6 +1002,14 @@ class LedgerEngine:
             )
             writer.writeheader()
             writer.writerows(self.decisions)
+
+        with open(self.output_dir / "reminders.csv", mode="w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["as_of_date", "id", "lot_ref", "expiry_date", "remaining_balance"],
+            )
+            writer.writeheader()
+            writer.writerows(self.reminders)
 
         with open(self.output_dir / "statements.csv", mode="w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(
@@ -904,6 +1083,21 @@ class LedgerEngine:
                     continue
                 parts = line.split("|")
                 cmd = parts[0].strip()
+
+                if cmd == "MONTH_END":
+                    self._void_due_cards(f"{month_last_day(parts[1].strip())} 23:59:59")
+                elif cmd in {
+                    "ISSUE",
+                    "ACTIVATE",
+                    "LOAD_WALLET",
+                    "REDEEM",
+                    "REVERSE",
+                    "CHARGEBACK",
+                    "REACTIVATE",
+                    "REPORT_LOST",
+                    "TRANSFER_LOST",
+                }:
+                    self._void_due_cards(parts[1].strip())
 
                 if cmd == "ISSUE":
                     self.handle_issue(line_no, parts)

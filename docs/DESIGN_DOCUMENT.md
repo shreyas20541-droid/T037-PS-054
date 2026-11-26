@@ -2,14 +2,14 @@
 
 ## Overview
 
-The engine is a sequential batch processor. The CLI loads `stores.csv` and `wallets.csv`, then dispatches each command from `commands.txt` in source order. The processor mutates SQLite state, adds auditable ledger entries, and writes four CSV reports. Values are rounded and serialized to two decimal places. SQLite `REAL` columns store money; balances are not stored as integer paise.
+The engine is a sequential batch processor. The CLI loads `stores.csv` and `wallets.csv`, then dispatches each command from `commands.txt` in source order. The processor mutates SQLite state, adds auditable ledger entries, and writes five CSV outputs. Values are rounded and serialized to two decimal places. SQLite `REAL` columns store money; balances are not stored as integer paise.
 
 ## Glossary of Terms
 
 | Term | Definition |
 |---|---|
 | Gift Card (Fixed/Open) | A stored-value card issued with a fixed denomination or an open denomination. It begins inactive and has a single backing card lot identified by its `card_id`; transferred cards receive a new ID and backing lot. |
-| Wallet (MIN_KYC/FULL_KYC) | A customer account with a KYC tier that determines the applicable wallet holding and load limits. MIN_KYC has Rs 10,000 holding and monthly-load caps; FULL_KYC has a Rs 200,000 holding cap and a Rs 50,000 daily spend cap. |
+| Wallet (MIN_KYC/FULL_KYC) | A customer account with a KYC tier that determines the applicable wallet holding and load limits. MIN_KYC has Rs 10,000 holding and monthly-load caps; FULL_KYC has a Rs 200,000 holding cap, Rs 100,000 monthly-load cap, and Rs 50,000 daily spend cap. |
 | Lot (CARD/PAID/PROMO/REVERSAL) | A balance tranche with an owner, creation time, original and remaining amount, and expiry date. CARD backs a gift card; PAID and PROMO represent wallet loads; REVERSAL represents a later-day refund tranche. |
 | FEFO Allocation | First-expiring-first-out allocation: eligible lots are consumed by earliest expiry, with creation time breaking expiry ties. PROMO lots are prioritized ahead of other lots. |
 | Breakage | An unspent positive lot balance recognized after its expiry grace period has elapsed. |
@@ -46,6 +46,12 @@ erDiagram
         TEXT expiry_date
         TEXT frozen_ts
         INTEGER waiver_used
+    }
+    card_refunds {
+        TEXT card_id PK
+        TEXT refund_date
+        TEXT original_tender
+        REAL amount
     }
     lots {
         TEXT lot_ref PK
@@ -147,21 +153,21 @@ This is a conceptual lifecycle combining the card and its backing lot. In the da
 | Rule ID | Description | Trigger condition | Exact outcome / reason code |
 |---|---|---|---|
 | BR-01 | Validate card issuance denomination and type. | `ISSUE` value is below Rs 100, above Rs 10,000, or not a multiple of Rs 50; or card ID already exists. | Invalid or duplicate issue is ignored; no decision row. Valid issue creates an `INACTIVE` card and inactive CARD lot. |
-| BR-02 | Enforce the activation window and card expiry. | `ACTIVATE` is submitted for an inactive card. | Day 180 from issue date is valid; activation sets ACTIVE and expiry to activation date + 365 days. After day 180, set VOIDED and close the backing lot at zero. No decision row. |
-| BR-03 | Enforce wallet load limits and unique load references. | `LOAD_WALLET`, including `BALANCE_TO_10000`. | MIN_KYC: Rs 10,000 holding and calendar-month gross-load caps. FULL_KYC: Rs 200,000 holding cap. Accepted load is APPROVED/`OK`; violations are DECLINED/`HOLDING_LIMIT` or `MONTHLY_LOAD_LIMIT`; invalid amount/ref/wallet use `INVALID_AMOUNT`, `DUPLICATE_REF`, or `INVALID_WALLET`. Literal load computes the positive amount needed to bring the balance to Rs 10,000. |
-| BR-04 | Assign load-lot expiry. | Accepted wallet load. | PROMO expiry is load date + 90 days; PAID expiry is load date + 365 days. A lot remains redeemable on its expiry date and expires after that date. |
+| BR-02 | Enforce the activation window and card expiry. | `ACTIVATE` is submitted for an inactive card, or a later command/month end passes day 180. | Day 180 from issue date is valid; activation sets ACTIVE and expiry to activation date + 3 calendar years. On day 181, an unactivated card is automatically set VOIDED, its lot is closed, and a refund record captures the original tender and issue amount. No decision row. |
+| BR-03 | Enforce wallet load limits and unique load references. | `LOAD_WALLET`, including `BALANCE_TO_10000`. | MIN_KYC: Rs 10,000 holding and calendar-month gross-load caps. FULL_KYC: Rs 200,000 holding and Rs 100,000 calendar-month gross-load caps. Accepted load is APPROVED/`OK`; violations are DECLINED/`HOLDING_LIMIT` or `MONTHLY_LOAD_LIMIT`; invalid amount/ref/wallet use `INVALID_AMOUNT`, `DUPLICATE_REF`, or `INVALID_WALLET`. Literal load computes the positive amount needed to bring the balance to Rs 10,000. |
+| BR-04 | Assign load-lot expiry. | Accepted wallet load. | PROMO expiry is load date + 90 days; PAID expiry is load date + 1 calendar year. A lot remains redeemable on its expiry date and expires after that date. |
 | BR-05 | Validate redemption target, card state, wallet block, PIN, and transaction uniqueness. | `REDEEM` uses a duplicate transaction ID, invalid or inactive target, frozen card, blocked wallet, or ONLINE card redemption without a valid PIN. | DECLINED with `DUPLICATE_TXN`, `INVALID_CARD`, `INVALID_WALLET`, `NOT_ACTIVATED`, `CARD_INACTIVE`, `CARD_FROZEN`, `WALLET_BLOCKED`, `PIN_REQUIRED`, or `INVALID_PIN`, as applicable. |
 | BR-06 | Cap stored-value contribution to restricted-goods bills. | `restricted_amount > 0` and requested value exceeds 70% of bill total. | Approve the capped amount as PARTIAL/`RESTRICTED_CAP_70`; remainder is paid by another tender. |
 | BR-07 | Allocate redemptions to eligible lots. | Valid redemption with available funds. | Consume PROMO lots first, then FEFO by expiry date and creation time. Lots expiring today remain eligible. |
 | BR-08 | Handle insufficient balance and one-time small-card waiver. | Requested/capped amount exceeds balance, or available CARD balance is below Rs 10 and waiver is unused. | Insufficient balance is DECLINED/`INSUFFICIENT_FUNDS`. Otherwise apply the remaining card balance, waive the shortfall once, and close the card with PARTIAL/`SMALL_BALANCE_WAIVER`. |
-| BR-09 | Enforce daily redemption velocity and FULL_KYC spend cap. | Card would exceed five approved redemptions in a calendar day, or FULL_KYC wallet's current-day applied spend plus request exceeds Rs 50,000. | Decline with `VELOCITY`; a new calendar day starts a fresh count. |
+| BR-09 | Enforce daily redemption velocity and tiered wallet spend caps. | Card would exceed five approved redemptions in a calendar day, or wallet's current-day applied spend plus the capped request exceeds Rs 10,000 (MIN_KYC) or Rs 50,000 (FULL_KYC). | Decline with `VELOCITY`; restricted-bill caps are applied before checking spend, and a new calendar day starts a fresh count. |
 | BR-10 | Reverse a redemption using its original allocation. | `REVERSE` references a known, not-yet-reversed redemption. | Same-day reversal restores the exact original lots; later reversal creates REVERSAL lots with original expiry. Portions whose expiry date has passed are skipped. Result uses `OK`, `PARTIAL_EXPIRED`, or `LOT_EXPIRED`; invalid/already-reversed uses `INVALID_OR_REVERSED`. |
-| BR-11 | Apply load chargebacks within the recovery window. | `CHARGEBACK` is requested no more than 120 calendar days after load. | Claw back the full original lot value and report APPROVED/`OK`; consumed value becomes a negative lot and blocks redemptions. Later top-ups offset debt before becoming new spendable balance. Invalid/repeated lot uses `INVALID_LOT`; day 121+ uses `OUTSIDE_WINDOW`. |
-| BR-12 | Reactivate an expired lot at most once during its grace period. | `REACTIVATE` targets an EXPIRED lot; expiry-age is measured in calendar days. | Day 90 is valid: deduct 10% fee, restore 90%, and set expiry to six months after reactivation. Day 91+ is DECLINED/`GRACE_EXPIRED`; repeat is `ALREADY_REACTIVATED`; non-expired/missing is `NOT_EXPIRED`. |
+| BR-11 | Apply load chargebacks within the recovery window. | `CHARGEBACK` references a PAID or PROMO wallet load no more than 120 calendar days after loading. | Claw back the remaining active lot value; consumed value becomes a negative lot and blocks redemptions. Later top-ups offset debt before becoming new spendable balance. Expired lots are removed from breakage and do not create wallet debt. Non-load or repeated references use `INVALID_LOT`; day 121+ uses `OUTSIDE_WINDOW`. |
+| BR-12 | Reactivate an expired lot at most once during its grace period. | `REACTIVATE` targets an EXPIRED lot; expiry-age is measured in calendar days. | Day 90 is valid: deduct 10% fee, restore 90%, and set expiry to six months after reactivation. Reactivation is declined with `HOLDING_LIMIT` if it would breach the wallet's KYC holding cap. Day 91+ is DECLINED/`GRACE_EXPIRED`; repeat is `ALREADY_REACTIVATED`; non-expired/missing is `NOT_EXPIRED`. |
 | BR-13 | Freeze reported-lost cards. | `REPORT_LOST` targets an ACTIVE or INACTIVE card. | Set card state to FROZEN; subsequent redemption is declined with `CARD_FROZEN`. The command does not create a decision row. |
-| BR-14 | Transfer a lost card after the quiet period. | `TRANSFER_LOST` targets a frozen card and proposes a new card ID. | Fewer than 7 calendar days is DECLINED/`TOO_EARLY`; not frozen is `NOT_FROZEN`; duplicate new ID is `DUPLICATE_CARD`. After 7 days, transfer the balance less min(Rs 50, balance), preserve expiry, mark old card TRANSFERRED, and return APPROVED/`OK`. |
-| BR-15 | Expire lots and recognize breakage at month end. | `MONTH_END|YYYY-MM` reaches the end of a month. | Expire ACTIVE lots whose expiry is on or before the month end. Move positive remaining expired value to BREAKAGE when it is more than 90 days past expiry; record recognition on the month's last date. No decision row. |
-| BR-16 | Keep an auditable ledger and emit the specified reports. | Accepted financial operation, `PRINT_STATEMENT`, or report print/month-end command. | Record debit/credit and post-entry lot/account balances; statement/report headers and order follow the README schemas. Month-end `reconciles` is `true` when opening + loads - redemptions + reversals - expiries - chargebacks equals closing liability within Rs 0.02, otherwise `false`. |
+| BR-14 | Transfer a lost card after the quiet period. | `TRANSFER_LOST` targets a frozen card and proposes a new card ID. | Fewer than 7 calendar days is DECLINED/`TOO_EARLY`; not frozen is `NOT_FROZEN`; duplicate new ID is `DUPLICATE_CARD`. After 7 days, transfer all unexpired card lots less min(Rs 50, balance), preserving each lot's expiry, mark old card TRANSFERRED, and return APPROVED/`OK`. |
+| BR-15 | Expire lots and recognize breakage at month end. | `MONTH_END|YYYY-MM` reaches the end of a month. | Expire ACTIVE lots whose expiry is on or before the month end. When the 90-day grace period has passed, move positive remaining value to BREAKAGE and record its recognition on the first day after the reporting month. No decision row. |
+| BR-16 | Keep an auditable ledger and emit the specified reports. | Accepted financial operation, `PRINT_STATEMENT`, or report print/month-end command. | Record debit/credit and post-entry lot/account balances; emit the four specified reports plus `reminders.csv`, listing positive active lots expiring within 30 days of each month end. Month-end liability excludes negative wallets; liability flow counts only the chargeback/load amounts that change included liability. Reconciliation must match exactly to the paisa: opening + loads - redemptions + reversals - expiries - chargebacks = closing liability. |
 
 ### Sample-Pack Consistency Note
 
